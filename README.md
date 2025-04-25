@@ -16,7 +16,6 @@
 - Port exclusion and range support
 - Hostname spoofing
 - MAC spoof stub (for later extension)
-- XOR-based string obfuscation function
 - No console window — results shown via `MessageBoxA`
 
 ---
