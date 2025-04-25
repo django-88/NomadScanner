@@ -1,22 +1,36 @@
 # NomadScanner - Stealth Portscanner for Red Teams
 
-**NomadScanner** is a stealthy, memory-only Windows port scanner designed for red team operations, evasion testing, and internal assessments. It uses randomized HTTP probes, domain fronting, in-memory result handling, and optional payloads for scanning without dropping files or generating noisy output.
+**NomadScanner** is a hardened, memory-only Windows port scanner built for red teamers and penetration testers who need maximum stealth and OPSEC. It sends fully in-memory HTTP probes with randomized network characteristics to blend into normal traffic patterns.
 
 ---
 
 ## Features
 
-- Memory-only output (no stdout or file writes)
-- Multithreaded scanning with jittered delays
-- IPv4 & IPv6 support via getaddrinfo
-- Randomized HTTP probes (GET, HEAD, OPTIONS)
-- Domain fronting (custom Host headers)
-- Custom payload support (HTTP template style)
-- Banner grabbing for fingerprinting
-- Port exclusion and range support
-- Hostname spoofing
-- MAC spoof stub (for later extension)
-- No console window — results shown via `MessageBoxA`
+- **In-memory output** (no file writes or disk artifacts)
+- **Console-based** for scriptable integration
+- **Multithreaded scanning** with configurable jitter (pre/post connection delays)
+- **IPv4 & IPv6** support via `getaddrinfo`
+- **Randomized HTTP probes**
+  - Shuffles between `GET`, `HEAD`, and `OPTIONS`
+  - Random `User-Agent` strings
+  - Variable HTTP padding (random-length junk after headers)
+- **Domain fronting** (custom `Host:` header)
+- **Custom payload templates** for bespoke requests
+- **Banner grabbing** of service responses
+- **Port range & exclusion** syntax (e.g., `1-1024`, `135,445`)
+- **Hostname spoofing** (machine name impersonation)
+- **MAC address spoof stub** for future extension
+
+### Advanced Network Stealth
+
+- **Random ephemeral source port** binding (49152–65535)
+- **Variable IP TTL** (1–128) to evade simple TTL-based filters
+- **Random IP TOS** values to alter packet priority bits
+- **Set IP “Don’t Fragment” bit** to control path MTU behaviors
+- **Dynamic TCP window size** tuning and **Nagle disabling** (`TCP_NODELAY`)
+- **Pre-connection jitter** delays to mimic user behavior
+
+
 
 ---
 
@@ -46,13 +60,14 @@ NomadScanner.exe 10.0.0.5 80-90 payload.txt 135,445 www.microsoft.com
 If using a `payload.txt` file, use placeholders:
 
 ```http
-GET /status HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n\r\n
+%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n\r\n
 ```
 
 Where:
-- `%s` → replaced with fronting domain or IP
-- `%s` → replaced with randomized `User-Agent`
-
+- 1st`%s`:HTTP method
+- 2nd`%s`:request path
+- 3rd`%s`:host or domain front
+- 4th`%s`:randomized `User-Agent`
 ---
 
 ## Build Instructions
