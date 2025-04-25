@@ -70,23 +70,6 @@ Where:
 gcc -mwindows -s -O3 -o NomadScanner.exe main.c -lws2_32 -liphlpapi
 ```
 
----
-
-## Recommended Files to Include
-
-```
-NomadScanner/
-├── main.c
-├── NomadScanner.sln
-├── NomadScanner.vcxproj
-├── NomadScanner.vcxproj.filters
-├── payload.txt               # optional
-├── .gitignore
-├── LICENSE
-└── README.md
-```
-
-> Exclude: `.vs/`, `*.exe`, `*.obj`, `x64/`, `Debug/`, `Release/`
 
 ---
 
