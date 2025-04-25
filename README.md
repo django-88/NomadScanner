@@ -109,3 +109,6 @@ MIT License – see [LICENSE](LICENSE)
 - [ ] Named pipe or in-memory IPC output support
 - [ ] Encrypted strings and shellcode-ready compile path
 
+## Shoutout
+
+Huge thanks to https://github.com/mr-un1k0d3r for his courses and inspirational coding videos.
