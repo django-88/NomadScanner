@@ -1,23 +1,3 @@
-/*
- * NomadScanner - OPSEC-hardened TCP port scanner
- *
- * Build:
- *   cl /O2 /W4 NomadScanner.c /link ws2_32.lib iphlpapi.lib
- *
- * OPSEC improvements over original:
- *   - Non-blocking connect() with WSAPoll() for reliable timeouts
- *   - CryptGenRandom() replaces rand() for all entropy (thread-safe, unpredictable)
- *   - Realistic TTL ranges per OS fingerprint bucket
- *   - Full alphanumeric charset for HTTP padding (not just A-Z)
- *   - strtok_s() everywhere (thread-safe)
- *   - Banner grabbing is opt-in, not always-on
- *   - Thread batch uses a timed WaitForMultipleObjects (no infinite hang)
- *   - Memory zeroed on free for sensitive fields
- *   - All format strings validated (no user-controlled format arguments)
- *   - AppendToBuffer() safe even if called before locks init
- *   - COMPUTERNAME spoof removed (ineffective; real spoof needs kernel tricks)
- */
-
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 
