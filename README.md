@@ -28,8 +28,8 @@ NomadScanner performs in-memory, multithreaded TCP connect scans with randomised
 
 ### Network Stealth
 
-- **`CryptGenRandom`-backed CSPRNG** for all entropy (source ports, TTL, TOS, padding, window sizes) — replaces `rand()` entirely
-- **Realistic TTL values** sampled from OS fingerprint buckets (64 / 128 / 255) with ±3 variance — no constant or obviously-random values
+- **`CryptGenRandom`-backed CSPRNG** for all entropy (source ports, TTL, TOS, padding, window sizes) replaces `rand()` entirely
+- **Realistic TTL values** sampled from OS fingerprint buckets (64 / 128 / 255) with ±3 variance no constant or obviously-random values
 - **Realistic DSCP/TOS** — weighted toward CS0 (the vast majority of real traffic), with occasional CS1/CS2/CS6
 - **Random ephemeral source port** per connection (IANA dynamic range 49152–65535)
 - **Randomised TCP window and buffer sizes** per socket
@@ -108,34 +108,6 @@ Four positional `%s` arguments are substituted in order:
 
 ---
 
-## Design Notes
-
-**Why `CryptGenRandom` instead of `rand()`?**
-`rand()` seeded with `time()` produces predictable sequences trivially correlated across runs. All per-probe entropy (source port, TTL, TOS, padding length, window size) now comes from the kernel CSPRNG, making each connection statistically independent.
-
-**Why `WSAPoll()` for connect?**
-`SO_SNDTIMEO` does not bound `connect()` on Windows — it only applies to `send()`/`recv()`. Without non-blocking connect and explicit polling, filtered ports would stall for the kernel TCP timeout (20+ seconds). The poll loop respects `--timeout` exactly.
-
-**Why realistic TTL buckets instead of full range?**
-TTLs of 1–10 die at the first router hop. More importantly, random TTLs (e.g., 37, 203, 11) are a textbook scanner fingerprint. Sampling from `{64, 128, 255}` with minor variance matches the actual distribution of live OS traffic.
-
-**Why is banner grabbing opt-in?**
-Sending an HTTP probe to an open SSH, SMTP, or RDP port leaves artefacts in server logs and produces anomalous protocol events. Separating port discovery from service probing is the cleaner OPSEC model.
-
-**Why was `--spoof-hostname` removed?**
-`SetEnvironmentVariableA("COMPUTERNAME", ...)` only affects `GetEnvironmentVariable()` callers within the current process. It has no effect on `GetComputerNameA()`, NetBIOS queries, WMI, or any kernel-level hostname resolution. The feature provided a false sense of coverage without any real defensive value.
-
----
-
-## Roadmap
-
-- [ ] BOF (Beacon Object File) port for Cobalt Strike / Havoc / Sliver
-- [ ] Named pipe and in-memory IPC output modes
-- [ ] Linux port (raw sockets, epoll-based dispatcher)
-- [ ] String encryption and position-independent compile path
-- [ ] SOCKS5 proxy support for pivoting scenarios
-
----
 
 ## Legal
 
