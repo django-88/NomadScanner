@@ -77,16 +77,16 @@ NomadScanner.exe <target> <ports> [options]
 ### Examples
 
 ```bat
-REM Basic scan
+# Basic scan
 NomadScanner.exe 192.168.1.1 80,443
 
-REM Range scan with exclusions
+# Range scan with exclusions
 NomadScanner.exe 10.0.0.1 1-1024 --exclude=135,445
 
-REM Domain fronting with banner grab
+# Domain fronting with banner grab
 NomadScanner.exe 10.0.0.5 80,443,8080 --front=www.microsoft.com --banner
 
-REM Low-and-slow with high jitter
+# Low-and-slow with high jitter
 NomadScanner.exe 10.0.0.1 1-65535 --threads=5 --jitter=500-5000 --timeout=3000
 ```
 
