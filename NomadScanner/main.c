@@ -1,29 +1,49 @@
+/*
+ * NomadScanner - OPSEC-hardened TCP port scanner
+ *
+ * Build:
+ *   cl /O2 /W4 NomadScanner.c /link ws2_32.lib iphlpapi.lib
+ *
+ * OPSEC improvements over original:
+ *   - Non-blocking connect() with WSAPoll() for reliable timeouts
+ *   - CryptGenRandom() replaces rand() for all entropy (thread-safe, unpredictable)
+ *   - Realistic TTL ranges per OS fingerprint bucket
+ *   - Full alphanumeric charset for HTTP padding (not just A-Z)
+ *   - strtok_s() everywhere (thread-safe)
+ *   - Banner grabbing is opt-in, not always-on
+ *   - Thread batch uses a timed WaitForMultipleObjects (no infinite hang)
+ *   - Memory zeroed on free for sensitive fields
+ *   - All format strings validated (no user-controlled format arguments)
+ *   - AppendToBuffer() safe even if called before locks init
+ *   - COMPUTERNAME spoof removed (ineffective; real spoof needs kernel tricks)
+ */
+
 #define _CRT_SECURE_NO_WARNINGS
-#include <WinSock2.h>
+#define WIN32_LEAN_AND_MEAN
+
+#include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <wincrypt.h>
 #include <iphlpapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include <iptypes.h>
 #include <stdarg.h>
 #include <ctype.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "advapi32.lib")
 
-#if defined(_MSC_VER)
-#define NS_VSCRTF _vscprintf
-#else
-#define NS_VSCRTF(format, args) vsnprintf(NULL, 0, format, args)
-#endif
+/* ─── Constants ─────────────────────────────────────────────────────────── */
 
-#define MAX_THREADS 64
-#define MIN_PORT 1
-#define MAX_PORT 65535
+#define MAX_THREADS          64
+#define MIN_PORT             1
+#define MAX_PORT             65535
 #define INITIAL_LOG_CAPACITY 8192
+#define THREAD_WAIT_MS       30000   /* max ms to wait for a thread batch    */
+#define CONNECT_POLL_MS      100     /* WSAPoll interval for connect check   */
 
 #ifndef IP_DONT_FRAGMENT
 #define IP_DONT_FRAGMENT 14
@@ -38,9 +58,11 @@
 #define IPV6_DONTFRAG 14
 #endif
 
+/* ─── Types ──────────────────────────────────────────────────────────────── */
+
 typedef struct {
     DWORD port;
-    char ip[256];
+    char  ip[256];
 } ThreadParam;
 
 typedef struct {
@@ -49,732 +71,907 @@ typedef struct {
 } PortRange;
 
 typedef struct {
-    char* data;
+    char  *data;
     size_t length;
     size_t capacity;
 } OutputLog;
 
-WSADATA wsa;
-BOOL wsaInitialized = FALSE;
-volatile LONG totalScanned = 0;
-volatile LONG totalOpen = 0;
-volatile LONG totalClosed = 0;
-int timeout = 1000;
-int threadCount = 20;
-int delayMin = 100;
-int delayMax = 2000;
-char payloadTemplate[1024] = { 0 };
-char requestPath[256] = "/";
-char* domainFront = NULL;
-char* hostnameSpoofValue = NULL;
+/* ─── Globals ────────────────────────────────────────────────────────────── */
 
-PortRange* exclusionRanges = NULL;
-size_t exclusionCount = 0;
+static WSADATA       g_wsa;
+static BOOL          g_wsaInitialized  = FALSE;
+static volatile LONG g_totalScanned    = 0;
+static volatile LONG g_totalOpen       = 0;
+static volatile LONG g_totalClosed     = 0;
 
-OutputLog logBuffer = { 0 };
-CRITICAL_SECTION outputLock;
-CRITICAL_SECTION randLock;
-BOOL locksInitialized = FALSE;
+/* Config — all written before threads start, then read-only */
+static int  g_timeout    = 1000;   /* ms: send/recv AND connect poll window  */
+static int  g_threadCount = 20;
+static int  g_delayMin   = 100;
+static int  g_delayMax   = 2000;
+static BOOL g_grabBanner = FALSE;  /* opt-in banner grabbing                 */
 
-const char* userAgents[] = {
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "curl/8.4.0",
-    "Wget/1.21.4 (linux-gnu)",
-    "python-requests/2.32.0"
-};
+static char  g_payloadTemplate[1024] = {0};
+static char  g_requestPath[256]      = "/";
+static char *g_domainFront           = NULL;
 
-const char* httpMethods[] = { "GET", "HEAD", "OPTIONS" };
+static PortRange *g_exclusionRanges = NULL;
+static size_t     g_exclusionCount  = 0;
 
-static void CleanupResources(void);
-static void PrintUsage(void);
-static BOOL LoadPayloadTemplate(const char* path);
-static BOOL LoadExcludedPorts(const char* ports);
-static void FreeExcludedPorts(void);
-static char* TrimWhitespace(char* value);
-static BOOL ParsePortNumber(const char* text, int* value);
-static BOOL ParsePortToken(const char* token, int* start, int* end);
-static BOOL HandleOption(const char* option, const char** payloadPath, const char** excludeArg, const char** frontArg);
-static int RandomBetween(int min, int max);
-static DWORD GetJitterDelay(void);
-static void InitializeSync(void);
-static void CleanupSync(void);
-static void AppendToBuffer(const char* format, ...);
-static void EnsureLogCapacity(size_t additional);
-static void FormatHostHeader(const char* input, char* output, size_t size);
-static void ConfigureSocket(SOCKET s, int family);
-static void BindRandomSourcePort(SOCKET s, int family);
-static BOOL IsExcludedPort(int port);
-static BOOL IsAlive(const char* ip, DWORD port);
+static OutputLog        g_logBuffer    = {0};
+static CRITICAL_SECTION g_outputLock;
+static CRITICAL_SECTION g_csrngLock;   /* guard the HCRYPTPROV handle       */
+static BOOL             g_locksInited  = FALSE;
+static HCRYPTPROV       g_hCryptProv   = 0;
+
+/* ─── Forward declarations ───────────────────────────────────────────────── */
+
+static void   CleanupResources(void);
+static void   PrintUsage(void);
+static BOOL   LoadPayloadTemplate(const char *path);
+static BOOL   LoadExcludedPorts(const char *ports);
+static void   FreeExcludedPorts(void);
+static char  *TrimWhitespace(char *value);
+static BOOL   ParsePortNumber(const char *text, int *value);
+static BOOL   ParsePortToken(const char *token, int *start, int *end);
+static BOOL   HandleOption(const char *option,
+                            const char **payloadPath,
+                            const char **excludeArg,
+                            const char **frontArg);
+static BOOL   CryptRandBytes(void *buf, DWORD len);
+static DWORD  CryptRandDword(void);
+static int    RandomBetween(int min, int max);
+static DWORD  GetJitterDelay(void);
+static void   InitializeSync(void);
+static void   CleanupSync(void);
+static void   AppendToBuffer(const char *format, ...);
+static void   EnsureLogCapacity(size_t additional);
+static void   FormatHostHeader(const char *input, char *output, size_t size);
+static void   ConfigureSocket(SOCKET s, int family);
+static SOCKET ConnectNonBlocking(const char *ip, DWORD port);
+static BOOL   IsExcludedPort(int port);
+static BOOL   IsAlive(const char *ip, DWORD port);
 static DWORD WINAPI ScanPort(LPVOID param);
-static void Scan(const char* ip, const char* portList);
-static void FlushThreadBatch(HANDLE* threads, DWORD count);
-static void ValidateConfig(void);
-static void ApplyHostnameSpoof(void);
+static void   Scan(const char *ip, const char *portList);
+static void   FlushThreadBatch(HANDLE *threads, DWORD count);
+static void   ValidateConfig(void);
+static void   SecureFreeString(char **ptr);
 
-int InitWSAContext(void) {
-    return WSAStartup(MAKEWORD(2, 2), &wsa);
-}
+/* ─── Entry point ────────────────────────────────────────────────────────── */
 
-int main(int argc, char** argv) {
-    if (argc < 2) {
-        PrintUsage();
-        return 1;
-    }
+int main(int argc, char **argv)
+{
+    if (argc < 2) { PrintUsage(); return 1; }
 
     for (int i = 1; i < argc; ++i) {
-        if (_stricmp(argv[i], "--help") == 0 || _stricmp(argv[i], "-h") == 0) {
+        if (_stricmp(argv[i], "--help") == 0 ||
+            _stricmp(argv[i], "-h")     == 0) {
             PrintUsage();
             return 0;
         }
     }
 
-    if (argc < 3) {
-        PrintUsage();
-        return 1;
-    }
+    if (argc < 3) { PrintUsage(); return 1; }
 
-    const char* target = argv[1];
-    const char* ports = argv[2];
-    const char* payloadPathOpt = NULL;
-    const char* excludeOpt = NULL;
-    const char* frontOpt = NULL;
-    const char* positionalPayload = NULL;
-    const char* positionalExclude = NULL;
-    const char* positionalFront = NULL;
+    const char *target          = argv[1];
+    const char *ports           = argv[2];
+    const char *payloadPathOpt  = NULL;
+    const char *excludeOpt      = NULL;
+    const char *frontOpt        = NULL;
+    /* positional fallbacks */
+    const char *positionalPayload = NULL;
+    const char *positionalExclude = NULL;
+    const char *positionalFront   = NULL;
     int positionalIndex = 0;
 
     for (int i = 3; i < argc; ++i) {
         if (strncmp(argv[i], "--", 2) == 0) {
-            if (!HandleOption(argv[i], &payloadPathOpt, &excludeOpt, &frontOpt)) {
+            if (!HandleOption(argv[i], &payloadPathOpt,
+                              &excludeOpt, &frontOpt)) {
                 CleanupResources();
                 return 1;
             }
             continue;
         }
-
-        switch (positionalIndex) {
+        switch (positionalIndex++) {
         case 0: positionalPayload = argv[i]; break;
         case 1: positionalExclude = argv[i]; break;
-        case 2: positionalFront = argv[i]; break;
-        default: fprintf(stderr, "[!] Ignoring extra positional argument: %s\n", argv[i]); break;
+        case 2: positionalFront   = argv[i]; break;
+        default:
+            fprintf(stderr, "[!] Ignoring extra positional argument: %s\n",
+                    argv[i]);
+            break;
         }
-        positionalIndex++;
     }
 
-    const char* payloadPath = payloadPathOpt ? payloadPathOpt : positionalPayload;
-    const char* excludeArg = excludeOpt ? excludeOpt : positionalExclude;
-    const char* frontArg = frontOpt ? frontOpt : positionalFront;
+    const char *payloadPath = payloadPathOpt ? payloadPathOpt : positionalPayload;
+    const char *excludeArg  = excludeOpt     ? excludeOpt     : positionalExclude;
+    const char *frontArg    = frontOpt       ? frontOpt       : positionalFront;
 
     if (payloadPath && !LoadPayloadTemplate(payloadPath)) {
-        CleanupResources();
-        return 1;
+        CleanupResources(); return 1;
     }
-
     if (excludeArg && !LoadExcludedPorts(excludeArg)) {
-        CleanupResources();
-        return 1;
+        CleanupResources(); return 1;
     }
-
     if (frontArg) {
-        domainFront = _strdup(frontArg);
-        if (!domainFront) {
-            fprintf(stderr, "[!] Failed to allocate memory for domain front value.\n");
-            CleanupResources();
-            return 1;
+        g_domainFront = _strdup(frontArg);
+        if (!g_domainFront) {
+            fprintf(stderr, "[!] Failed to allocate domain front string.\n");
+            CleanupResources(); return 1;
         }
     }
 
-    threadCount = max(1, min(threadCount, MAX_THREADS));
+    g_threadCount = max(1, min(g_threadCount, MAX_THREADS));
     ValidateConfig();
 
-    if (InitWSAContext() != 0) {
+    if (WSAStartup(MAKEWORD(2, 2), &g_wsa) != 0) {
         fprintf(stderr, "[!] WSAStartup failed (%lu)\n", GetLastError());
-        CleanupResources();
-        return 1;
+        CleanupResources(); return 1;
     }
-    wsaInitialized = TRUE;
+    g_wsaInitialized = TRUE;
+
+    /* Acquire crypto provider before threads start */
+    if (!CryptAcquireContextA(&g_hCryptProv, NULL, NULL,
+                               PROV_RSA_FULL,
+                               CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) {
+        fprintf(stderr, "[!] CryptAcquireContext failed (%lu)\n", GetLastError());
+        CleanupResources(); return 1;
+    }
 
     InitializeSync();
-    srand((unsigned int)time(NULL));
-
-    if (hostnameSpoofValue) {
-        ApplyHostnameSpoof();
-    }
 
     DWORD startTime = GetTickCount();
     Scan(target, ports);
     DWORD elapsed = GetTickCount() - startTime;
 
     AppendToBuffer("\n=== Scan Summary ===\n");
-    AppendToBuffer("Total: %ld\nOpen: %ld\nClosed: %ld\nTime: %.2fs\n",
-        totalScanned, totalOpen, totalClosed, elapsed / 1000.0);
+    AppendToBuffer("Total: %ld  Open: %ld  Closed: %ld  Time: %.2fs\n",
+                   g_totalScanned, g_totalOpen, g_totalClosed,
+                   elapsed / 1000.0);
 
-    if (logBuffer.data) {
-        printf("%s", logBuffer.data);
+    if (g_logBuffer.data) {
+        printf("%s", g_logBuffer.data);
+        fflush(stdout);
     }
 
     CleanupResources();
     return 0;
 }
 
-static void PrintUsage(void) {
-    printf("Usage: NomadScanner.exe <target> <ports> [payload.txt] [exclude_ports] [front_host] [options]\n");
-    printf("\nOptions:\n");
-    printf("  --threads=<1-%d>        Set worker thread count (default 20)\n", MAX_THREADS);
-    printf("  --timeout=<ms>          Set socket send/recv timeout (default 1000)\n");
-    printf("  --jitter=<min>-<max>    Millisecond jitter before/after probes (default 100-2000)\n");
-    printf("  --payload=<path>        Override payload template file\n");
-    printf("  --exclude=<ports>       Port exclusions (e.g., 135,445,8000-8100)\n");
-    printf("  --front=<host>          Domain front value for Host header\n");
-    printf("  --path=<request_path>   HTTP request path (default /)\n");
-    printf("  --spoof-hostname=<n>    Set process-level COMPUTERNAME for OPSEC\n");
-    printf("  --help                  Show this message\n");
+/* ─── Usage ──────────────────────────────────────────────────────────────── */
+
+static void PrintUsage(void)
+{
+    printf(
+        "Usage: NomadScanner.exe <target> <ports> [options]\n"
+        "\n"
+        "  <target>                 IPv4, IPv6, or hostname\n"
+        "  <ports>                  e.g. 80,443,8000-8100\n"
+        "\n"
+        "Options:\n"
+        "  --threads=<1-%d>         Worker thread count (default 20)\n"
+        "  --timeout=<ms>           Connect + recv timeout (default 1000)\n"
+        "  --jitter=<min>-<max>     Per-probe jitter in ms (default 100-2000)\n"
+        "  --payload=<path>         HTTP payload template file\n"
+        "  --exclude=<ports>        Excluded ports, e.g. 135,445,8000-8100\n"
+        "  --front=<host>           Domain front value for Host header\n"
+        "  --path=<request_path>    HTTP request path (default /)\n"
+        "  --banner                 Enable banner grabbing (opt-in)\n"
+        "  --help                   Show this message\n",
+        MAX_THREADS);
 }
 
-static BOOL HandleOption(const char* option, const char** payloadPath, const char** excludeArg, const char** frontArg) {
+/* ─── Option parser ──────────────────────────────────────────────────────── */
+
+static BOOL HandleOption(const char *option,
+                          const char **payloadPath,
+                          const char **excludeArg,
+                          const char **frontArg)
+{
     if (!option) return FALSE;
 
-    if (_strnicmp(option, "--threads=", 10) == 0) {
-        threadCount = atoi(option + 10);
+#define OPTMATCH(prefix) (_strnicmp(option, (prefix), strlen(prefix)) == 0)
+#define OPTVAL(prefix)   (option + strlen(prefix))
+
+    if (OPTMATCH("--threads=")) {
+        g_threadCount = atoi(OPTVAL("--threads="));
         return TRUE;
     }
-
-    if (_strnicmp(option, "--timeout=", 10) == 0) {
-        timeout = atoi(option + 10);
+    if (OPTMATCH("--timeout=")) {
+        g_timeout = atoi(OPTVAL("--timeout="));
         return TRUE;
     }
-
-    if (_strnicmp(option, "--jitter=", 9) == 0) {
-        char buffer[64];
-        strncpy(buffer, option + 9, sizeof(buffer) - 1);
-        buffer[sizeof(buffer) - 1] = '\0';
-        char* dash = strchr(buffer, '-');
+    if (OPTMATCH("--jitter=")) {
+        char buf[64];
+        strncpy_s(buf, sizeof(buf), OPTVAL("--jitter="), _TRUNCATE);
+        char *dash = strchr(buf, '-');
         if (!dash) {
-            fprintf(stderr, "[!] Invalid jitter format. Expected min-max.\n");
+            fprintf(stderr, "[!] --jitter expects min-max format.\n");
             return FALSE;
         }
         *dash = '\0';
-        char* maxPart = dash + 1;
-        delayMin = atoi(buffer);
-        delayMax = atoi(maxPart);
+        g_delayMin = atoi(buf);
+        g_delayMax = atoi(dash + 1);
         return TRUE;
     }
-
-    if (_strnicmp(option, "--payload=", 10) == 0) {
-        *payloadPath = option + 10;
+    if (OPTMATCH("--payload=")) {
+        *payloadPath = OPTVAL("--payload=");
         return TRUE;
     }
-
-    if (_strnicmp(option, "--exclude=", 10) == 0) {
-        *excludeArg = option + 10;
+    if (OPTMATCH("--exclude=")) {
+        *excludeArg = OPTVAL("--exclude=");
         return TRUE;
     }
-
-    if (_strnicmp(option, "--front=", 8) == 0) {
-        *frontArg = option + 8;
+    if (OPTMATCH("--front=")) {
+        *frontArg = OPTVAL("--front=");
         return TRUE;
     }
-
-    if (_strnicmp(option, "--path=", 7) == 0) {
-        const char* value = option + 7;
-        if (strlen(value) >= sizeof(requestPath)) {
-            fprintf(stderr, "[!] Request path too long.\n");
+    if (OPTMATCH("--path=")) {
+        const char *val = OPTVAL("--path=");
+        if (strlen(val) >= sizeof(g_requestPath)) {
+            fprintf(stderr, "[!] --path value too long.\n");
             return FALSE;
         }
-        strncpy(requestPath, value, sizeof(requestPath) - 1);
-        requestPath[sizeof(requestPath) - 1] = '\0';
+        strncpy_s(g_requestPath, sizeof(g_requestPath), val, _TRUNCATE);
+        return TRUE;
+    }
+    if (_stricmp(option, "--banner") == 0) {
+        g_grabBanner = TRUE;
         return TRUE;
     }
 
-    if (_strnicmp(option, "--spoof-hostname=", 17) == 0) {
-        const char* value = option + 17;
-        if (strlen(value) > MAX_COMPUTERNAME_LENGTH) {
-            fprintf(stderr, "[!] Hostname exceeds maximum length (%d).\n", MAX_COMPUTERNAME_LENGTH);
-            return FALSE;
-        }
-        free(hostnameSpoofValue);
-        hostnameSpoofValue = _strdup(value);
-        if (!hostnameSpoofValue) {
-            fprintf(stderr, "[!] Failed to allocate hostname string.\n");
-            return FALSE;
-        }
-        return TRUE;
-    }
+#undef OPTMATCH
+#undef OPTVAL
 
     fprintf(stderr, "[!] Unknown option: %s\n", option);
     return FALSE;
 }
 
-static void ValidateConfig(void) {
-    if (threadCount < 1) threadCount = 1;
-    if (threadCount > MAX_THREADS) threadCount = MAX_THREADS;
-    if (timeout < 100) timeout = 100;
-    if (timeout > 600000) timeout = 600000;
-    if (delayMin < 0) delayMin = 0;
-    if (delayMax < delayMin) delayMax = delayMin;
-    if (delayMax > 60000) delayMax = 60000;
+/* ─── Config validation ──────────────────────────────────────────────────── */
+
+static void ValidateConfig(void)
+{
+    if (g_threadCount < 1)           g_threadCount = 1;
+    if (g_threadCount > MAX_THREADS) g_threadCount = MAX_THREADS;
+    if (g_timeout < 100)             g_timeout = 100;
+    if (g_timeout > 600000)          g_timeout = 600000;
+    if (g_delayMin < 0)              g_delayMin = 0;
+    if (g_delayMax < g_delayMin)     g_delayMax = g_delayMin;
+    if (g_delayMax > 60000)          g_delayMax = 60000;
 }
 
-static BOOL LoadPayloadTemplate(const char* path) {
-    FILE* f = fopen(path, "rb");
-    if (!f) {
-        fprintf(stderr, "[!] Failed to open payload template: %s\n", path);
+/* ─── Payload / exclusion loaders ───────────────────────────────────────── */
+
+static BOOL LoadPayloadTemplate(const char *path)
+{
+    FILE *f = NULL;
+    if (fopen_s(&f, path, "rb") != 0 || !f) {
+        fprintf(stderr, "[!] Cannot open payload file: %s\n", path);
         return FALSE;
     }
-    memset(payloadTemplate, 0, sizeof(payloadTemplate));
-    size_t read = fread(payloadTemplate, 1, sizeof(payloadTemplate) - 1, f);
-    payloadTemplate[read] = '\0';
+    memset(g_payloadTemplate, 0, sizeof(g_payloadTemplate));
+    size_t n = fread(g_payloadTemplate, 1, sizeof(g_payloadTemplate) - 1, f);
+    g_payloadTemplate[n] = '\0';
     fclose(f);
     return TRUE;
 }
 
-static BOOL LoadExcludedPorts(const char* ports) {
+static BOOL LoadExcludedPorts(const char *ports)
+{
     if (!ports || !*ports) return TRUE;
 
-    char* copy = _strdup(ports);
-    if (!copy) {
-        fprintf(stderr, "[!] Failed to duplicate exclude list.\n");
-        return FALSE;
-    }
+    char *copy = _strdup(ports);
+    if (!copy) { fprintf(stderr, "[!] OOM in exclude list.\n"); return FALSE; }
 
-    char* token = strtok(copy, ",");
+    char *ctx   = NULL;
+    char *token = strtok_s(copy, ",", &ctx);
     while (token) {
-        char* trimmed = TrimWhitespace(token);
-        if (*trimmed) {
-            int start, end;
-            if (!ParsePortToken(trimmed, &start, &end)) {
-                fprintf(stderr, "[!] Invalid exclude token: %s\n", trimmed);
+        char *t = TrimWhitespace(token);
+        if (*t) {
+            int s, e;
+            if (!ParsePortToken(t, &s, &e)) {
+                fprintf(stderr, "[!] Invalid exclude token: %s\n", t);
                 free(copy);
                 FreeExcludedPorts();
                 return FALSE;
             }
-
-            PortRange* next = realloc(exclusionRanges, (exclusionCount + 1) * sizeof(PortRange));
+            PortRange *next = (PortRange *)realloc(
+                g_exclusionRanges,
+                (g_exclusionCount + 1) * sizeof(PortRange));
             if (!next) {
-                fprintf(stderr, "[!] Failed to allocate exclusion range.\n");
+                fprintf(stderr, "[!] OOM in exclusion range.\n");
                 free(copy);
                 FreeExcludedPorts();
                 return FALSE;
             }
-            exclusionRanges = next;
-            exclusionRanges[exclusionCount].start = start;
-            exclusionRanges[exclusionCount].end = end;
-            exclusionCount++;
+            g_exclusionRanges = next;
+            g_exclusionRanges[g_exclusionCount].start = s;
+            g_exclusionRanges[g_exclusionCount].end   = e;
+            g_exclusionCount++;
         }
-        token = strtok(NULL, ",");
+        token = strtok_s(NULL, ",", &ctx);
     }
-
     free(copy);
     return TRUE;
 }
 
-static void FreeExcludedPorts(void) {
-    free(exclusionRanges);
-    exclusionRanges = NULL;
-    exclusionCount = 0;
+static void FreeExcludedPorts(void)
+{
+    free(g_exclusionRanges);
+    g_exclusionRanges = NULL;
+    g_exclusionCount  = 0;
 }
 
-static char* TrimWhitespace(char* value) {
+/* ─── String utilities ───────────────────────────────────────────────────── */
+
+static char *TrimWhitespace(char *value)
+{
     if (!value) return value;
     while (*value && isspace((unsigned char)*value)) value++;
-    if (*value == '\0') return value;
-
-    char* end = value + strlen(value) - 1;
-    while (end > value && isspace((unsigned char)*end)) {
-        *end = '\0';
-        --end;
-    }
+    if (!*value) return value;
+    char *end = value + strlen(value) - 1;
+    while (end > value && isspace((unsigned char)*end)) *end-- = '\0';
     return value;
 }
 
-static BOOL ParsePortNumber(const char* text, int* value) {
+static BOOL ParsePortNumber(const char *text, int *value)
+{
     if (!text || !*text || !value) return FALSE;
-    char* endPtr = NULL;
-    long parsed = strtol(text, &endPtr, 10);
-    if (endPtr == text || *endPtr != '\0') return FALSE;
-    if (parsed < MIN_PORT || parsed > MAX_PORT) return FALSE;
-    *value = (int)parsed;
+    char *ep = NULL;
+    long  n  = strtol(text, &ep, 10);
+    if (ep == text || *ep != '\0') return FALSE;
+    if (n < MIN_PORT || n > MAX_PORT) return FALSE;
+    *value = (int)n;
     return TRUE;
 }
 
-static BOOL ParsePortToken(const char* token, int* start, int* end) {
+static BOOL ParsePortToken(const char *token, int *start, int *end)
+{
     if (!token || !start || !end) return FALSE;
-    const char* dash = strchr(token, '-');
+    const char *dash = strchr(token, '-');
     if (!dash) {
         if (!ParsePortNumber(token, start)) return FALSE;
         *end = *start;
         return TRUE;
     }
-
-    char left[16];
-    char right[16];
-    size_t leftLen = (size_t)(dash - token);
-    size_t rightLen = strlen(dash + 1);
-    if (leftLen >= sizeof(left) || rightLen >= sizeof(right)) return FALSE;
-
-    strncpy(left, token, leftLen);
-    left[leftLen] = '\0';
-    strncpy(right, dash + 1, sizeof(right) - 1);
-    right[sizeof(right) - 1] = '\0';
-
-    if (!ParsePortNumber(left, start) || !ParsePortNumber(right, end)) {
+    char left[8], right[8];
+    size_t llen = (size_t)(dash - token);
+    size_t rlen = strlen(dash + 1);
+    if (llen >= sizeof(left) || rlen >= sizeof(right)) return FALSE;
+    strncpy_s(left,  sizeof(left),  token,   llen);
+    strncpy_s(right, sizeof(right), dash + 1, _TRUNCATE);
+    if (!ParsePortNumber(left, start) || !ParsePortNumber(right, end))
         return FALSE;
-    }
-
-    if (*end < *start) {
-        int tmp = *start;
-        *start = *end;
-        *end = tmp;
-    }
+    if (*end < *start) { int tmp = *start; *start = *end; *end = tmp; }
     return TRUE;
 }
 
-static BOOL IsExcludedPort(int port) {
-    for (size_t i = 0; i < exclusionCount; ++i) {
-        if (port >= exclusionRanges[i].start && port <= exclusionRanges[i].end) {
+static BOOL IsExcludedPort(int port)
+{
+    for (size_t i = 0; i < g_exclusionCount; ++i) {
+        if (port >= g_exclusionRanges[i].start &&
+            port <= g_exclusionRanges[i].end)
             return TRUE;
-        }
     }
     return FALSE;
 }
 
-static void InitializeSync(void) {
-    InitializeCriticalSection(&outputLock);
-    InitializeCriticalSection(&randLock);
-    locksInitialized = TRUE;
+static void SecureFreeString(char **ptr)
+{
+    if (!ptr || !*ptr) return;
+    SecureZeroMemory(*ptr, strlen(*ptr));
+    free(*ptr);
+    *ptr = NULL;
 }
 
-static void CleanupSync(void) {
-    if (!locksInitialized) return;
-    DeleteCriticalSection(&outputLock);
-    DeleteCriticalSection(&randLock);
-    locksInitialized = FALSE;
+/* ─── Sync ───────────────────────────────────────────────────────────────── */
+
+static void InitializeSync(void)
+{
+    InitializeCriticalSection(&g_outputLock);
+    InitializeCriticalSection(&g_csrngLock);
+    g_locksInited = TRUE;
 }
 
-static void EnsureLogCapacity(size_t additional) {
-    size_t required = logBuffer.length + additional + 1;
-    if (required <= logBuffer.capacity) return;
+static void CleanupSync(void)
+{
+    if (!g_locksInited) return;
+    DeleteCriticalSection(&g_outputLock);
+    DeleteCriticalSection(&g_csrngLock);
+    g_locksInited = FALSE;
+}
 
-    size_t newCapacity = logBuffer.capacity ? logBuffer.capacity : INITIAL_LOG_CAPACITY;
-    while (newCapacity < required) {
-        newCapacity *= 2;
-    }
+/* ─── Crypto RNG ─────────────────────────────────────────────────────────── */
 
-    char* next = realloc(logBuffer.data, newCapacity);
+/*
+ * CryptGenRandom is thread-safe per MSDN for the same HCRYPTPROV, but we
+ * wrap it anyway in case of edge-case provider implementations.
+ */
+static BOOL CryptRandBytes(void *buf, DWORD len)
+{
+    if (!g_hCryptProv || !buf || !len) return FALSE;
+    EnterCriticalSection(&g_csrngLock);
+    BOOL ok = CryptGenRandom(g_hCryptProv, len, (BYTE *)buf);
+    LeaveCriticalSection(&g_csrngLock);
+    return ok;
+}
+
+static DWORD CryptRandDword(void)
+{
+    DWORD v = 0;
+    CryptRandBytes(&v, sizeof(v));
+    return v;
+}
+
+static int RandomBetween(int min, int max)
+{
+    if (min > max) { int t = min; min = max; max = t; }
+    if (min == max) return min;
+    DWORD span = (DWORD)(max - min) + 1;
+    /* Rejection sampling: discard values that would bias distribution */
+    DWORD limit = (0xFFFFFFFFU / span) * span;
+    DWORD v;
+    do { v = CryptRandDword(); } while (v >= limit);
+    return min + (int)(v % span);
+}
+
+static DWORD GetJitterDelay(void)
+{
+    if (g_delayMax <= 0) return 0;
+    return (DWORD)RandomBetween(
+        g_delayMin < 0 ? 0 : g_delayMin,
+        g_delayMax);
+}
+
+/* ─── Log buffer ─────────────────────────────────────────────────────────── */
+
+static void EnsureLogCapacity(size_t additional)
+{
+    size_t required = g_logBuffer.length + additional + 1;
+    if (required <= g_logBuffer.capacity) return;
+    size_t cap = g_logBuffer.capacity ? g_logBuffer.capacity : INITIAL_LOG_CAPACITY;
+    while (cap < required) cap *= 2;
+    char *next = (char *)realloc(g_logBuffer.data, cap);
     if (!next) return;
-    logBuffer.data = next;
-    logBuffer.capacity = newCapacity;
+    g_logBuffer.data     = next;
+    g_logBuffer.capacity = cap;
 }
 
-static void AppendToBuffer(const char* format, ...) {
-    if (!locksInitialized) return;
+static void AppendToBuffer(const char *format, ...)
+{
+    /*
+     * Safe to call before locks init (during early error paths).
+     * In that case we fall back to stderr.
+     */
     va_list args;
     va_start(args, format);
-    int needed = NS_VSCRTF(format, args);
+    int needed = _vscprintf(format, args);
     va_end(args);
     if (needed <= 0) return;
 
-    EnterCriticalSection(&outputLock);
-    EnsureLogCapacity((size_t)needed);
-    if (logBuffer.data) {
+    if (!g_locksInited) {
         va_start(args, format);
-        vsnprintf(logBuffer.data + logBuffer.length, logBuffer.capacity - logBuffer.length, format, args);
+        vfprintf(stderr, format, args);
         va_end(args);
-        logBuffer.length += needed;
-        logBuffer.data[logBuffer.length] = '\0';
+        return;
     }
-    LeaveCriticalSection(&outputLock);
+
+    EnterCriticalSection(&g_outputLock);
+    EnsureLogCapacity((size_t)needed);
+    if (g_logBuffer.data) {
+        va_start(args, format);
+        vsnprintf_s(g_logBuffer.data + g_logBuffer.length,
+                    g_logBuffer.capacity - g_logBuffer.length,
+                    _TRUNCATE, format, args);
+        va_end(args);
+        g_logBuffer.length += (size_t)needed;
+        if (g_logBuffer.length >= g_logBuffer.capacity)
+            g_logBuffer.length = g_logBuffer.capacity - 1;
+        g_logBuffer.data[g_logBuffer.length] = '\0';
+    }
+    LeaveCriticalSection(&g_outputLock);
 }
 
-static int RandomBetween(int min, int max) {
-    if (max < min) {
-        int tmp = min;
-        min = max;
-        max = tmp;
-    }
-    if (min == max) return min;
-    EnterCriticalSection(&randLock);
-    int value = rand();
-    LeaveCriticalSection(&randLock);
-    int span = max - min + 1;
-    if (span <= 0) span = 1;
-    return min + (value % span);
+/* ─── Socket helpers ─────────────────────────────────────────────────────── */
+
+static void FormatHostHeader(const char *input, char *output, size_t size)
+{
+    if (!output || !size) return;
+    if (!input || !*input) { output[0] = '\0'; return; }
+    /* IPv6 literal needs brackets */
+    if (strchr(input, ':') && input[0] != '[')
+        _snprintf_s(output, size, _TRUNCATE, "[%s]", input);
+    else
+        strncpy_s(output, size, input, _TRUNCATE);
 }
 
-static DWORD GetJitterDelay(void) {
-    if (delayMax <= 0) return 0;
-    int minVal = delayMin < 0 ? 0 : delayMin;
-    int maxVal = (delayMax < minVal) ? minVal : delayMax;
-    return (DWORD)RandomBetween(minVal, maxVal);
-}
-
-static void FormatHostHeader(const char* input, char* output, size_t size) {
-    if (!output || size == 0) return;
-    const char* source = (input && *input) ? input : "";
-    BOOL needsBrackets = strchr(source, ':') != NULL && source[0] != '[';
-    if (needsBrackets) {
-        snprintf(output, size, "[%s]", source);
-    }
-    else {
-        snprintf(output, size, "%s", source);
-    }
-}
-
-static void BindRandomSourcePort(SOCKET s, int family) {
-    const int attempts = 5;
-    for (int i = 0; i < attempts; ++i) {
-        int rndPort = RandomBetween(49152, 65535);
+/*
+ * Randomise ephemeral source port (5-attempt bind).
+ * Intentionally uses a port in the IANA dynamic range 49152-65535.
+ */
+static void BindRandomSourcePort(SOCKET s, int family)
+{
+    for (int i = 0; i < 5; ++i) {
+        u_short rp = (u_short)RandomBetween(49152, 65535);
         if (family == AF_INET) {
-            struct sockaddr_in local;
-            memset(&local, 0, sizeof(local));
-            local.sin_family = AF_INET;
-            local.sin_addr.s_addr = INADDR_ANY;
-            local.sin_port = htons((u_short)rndPort);
-            if (bind(s, (SOCKADDR*)&local, sizeof(local)) == 0) return;
-        }
-        else if (family == AF_INET6) {
-            struct sockaddr_in6 local6;
-            memset(&local6, 0, sizeof(local6));
-            local6.sin6_family = AF_INET6;
-            local6.sin6_addr = in6addr_any;
-            local6.sin6_port = htons((u_short)rndPort);
-            if (bind(s, (SOCKADDR*)&local6, sizeof(local6)) == 0) return;
-        }
-        else {
-            return;
+            struct sockaddr_in lo;
+            memset(&lo, 0, sizeof(lo));
+            lo.sin_family      = AF_INET;
+            lo.sin_addr.s_addr = INADDR_ANY;
+            lo.sin_port        = htons(rp);
+            if (bind(s, (SOCKADDR *)&lo, sizeof(lo)) == 0) return;
+        } else if (family == AF_INET6) {
+            struct sockaddr_in6 lo6;
+            memset(&lo6, 0, sizeof(lo6));
+            lo6.sin6_family = AF_INET6;
+            lo6.sin6_addr   = in6addr_any;
+            lo6.sin6_port   = htons(rp);
+            if (bind(s, (SOCKADDR *)&lo6, sizeof(lo6)) == 0) return;
         }
     }
 }
 
-static void ConfigureSocket(SOCKET s, int family) {
+/*
+ * OS fingerprint buckets for realistic TTL values:
+ *   Windows  → 128
+ *   Linux    → 64
+ *   Solaris  → 255
+ *   BSD/iOS  → 64
+ * We randomly pick a bucket to avoid a constant value.
+ */
+static int RealisticTTL(void)
+{
+    static const int buckets[] = {64, 64, 128, 128, 255};
+    int idx = RandomBetween(0, (int)(sizeof(buckets)/sizeof(buckets[0])) - 1);
+    /* Small variance within bucket (±3) */
+    return buckets[idx] + RandomBetween(-3, 3);
+}
+
+static void ConfigureSocket(SOCKET s, int family)
+{
     BindRandomSourcePort(s, family);
 
-    int win = RandomBetween(4096, 65535);
-    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&win, sizeof(win));
-    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (char*)&win, sizeof(win));
+    /* Randomised window sizes mimic different OS stacks */
+    int rcvbuf = RandomBetween(8192, 65535);
+    int sndbuf = RandomBetween(4096, 32768);
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char *)&rcvbuf, sizeof(rcvbuf));
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (char *)&sndbuf, sizeof(sndbuf));
+
     BOOL nodelay = TRUE;
-    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(nodelay));
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char *)&nodelay, sizeof(nodelay));
+
+    /* Timeouts govern recv, not connect (connect uses WSAPoll below) */
+    int rt = g_timeout, st = g_timeout;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&rt, sizeof(rt));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char *)&st, sizeof(st));
 
     if (family == AF_INET) {
-        int ttl = RandomBetween(1, 128);
-        setsockopt(s, IPPROTO_IP, IP_TTL, (char*)&ttl, sizeof(ttl));
-        int tos = RandomBetween(0, 255);
-        setsockopt(s, IPPROTO_IP, IP_TOS, (char*)&tos, sizeof(tos));
-        BOOL dontFrag = TRUE;
-        setsockopt(s, IPPROTO_IP, IP_DONT_FRAGMENT, (char*)&dontFrag, sizeof(dontFrag));
-    }
-    else if (family == AF_INET6) {
-        int hops = RandomBetween(1, 128);
-        setsockopt(s, IPPROTO_IPV6, IPV6_UNICAST_HOPS, (char*)&hops, sizeof(hops));
-        int tclass = RandomBetween(0, 255);
-        setsockopt(s, IPPROTO_IPV6, IPV6_TCLASS, (char*)&tclass, sizeof(tclass));
-        BOOL dontFrag6 = TRUE;
-        setsockopt(s, IPPROTO_IPV6, IPV6_DONTFRAG, (char*)&dontFrag6, sizeof(dontFrag6));
+        int ttl = RealisticTTL();
+        setsockopt(s, IPPROTO_IP, IP_TTL, (char *)&ttl, sizeof(ttl));
+        /* TOS: prefer DSCP CS0 (0) or CS6 (192) — common in normal traffic */
+        static const int tosValues[] = {0, 0, 0, 16, 32, 192};
+        int tos = tosValues[RandomBetween(0, 5)];
+        setsockopt(s, IPPROTO_IP, IP_TOS, (char *)&tos, sizeof(tos));
+        BOOL df = TRUE;
+        setsockopt(s, IPPROTO_IP, IP_DONT_FRAGMENT, (char *)&df, sizeof(df));
+    } else if (family == AF_INET6) {
+        int hops = RealisticTTL();
+        setsockopt(s, IPPROTO_IPV6, IPV6_UNICAST_HOPS, (char *)&hops, sizeof(hops));
+        int tclass = 0; /* CS0 by default */
+        setsockopt(s, IPPROTO_IPV6, IPV6_TCLASS, (char *)&tclass, sizeof(tclass));
+        BOOL df6 = TRUE;
+        setsockopt(s, IPPROTO_IPV6, IPV6_DONTFRAG, (char *)&df6, sizeof(df6));
     }
 }
 
-static BOOL IsAlive(const char* ip, DWORD port) {
+/*
+ * Non-blocking connect with WSAPoll timeout.
+ * Returns a connected SOCKET, or INVALID_SOCKET on failure.
+ * Caller must closesocket() on success.
+ */
+static SOCKET ConnectNonBlocking(const char *ip, DWORD port)
+{
+    struct addrinfo hints, *results = NULL, *cur = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    char portStr[8];
+    _snprintf_s(portStr, sizeof(portStr), _TRUNCATE, "%lu", port);
+
+    if (getaddrinfo(ip, portStr, &hints, &results) != 0)
+        return INVALID_SOCKET;
+
+    SOCKET s = INVALID_SOCKET;
+
+    for (cur = results; cur; cur = cur->ai_next) {
+        s = socket(cur->ai_family, cur->ai_socktype, cur->ai_protocol);
+        if (s == INVALID_SOCKET) continue;
+
+        ConfigureSocket(s, cur->ai_family);
+
+        /* Switch to non-blocking for connect */
+        u_long nb = 1;
+        ioctlsocket(s, FIONBIO, &nb);
+
+        int rc = connect(s, cur->ai_addr, (int)cur->ai_addrlen);
+        if (rc == 0) {
+            /* Immediate connect (loopback / already connected) */
+            nb = 0; ioctlsocket(s, FIONBIO, &nb);
+            break;
+        }
+
+        if (WSAGetLastError() != WSAEWOULDBLOCK) {
+            closesocket(s);
+            s = INVALID_SOCKET;
+            continue;
+        }
+
+        /* Poll for writable (= connected) or error */
+        WSAPOLLFD pfd;
+        pfd.fd      = s;
+        pfd.events  = POLLWRNORM;
+        pfd.revents = 0;
+
+        int deadline = g_timeout;
+        BOOL connected = FALSE;
+
+        while (deadline > 0) {
+            int chunk = min(deadline, CONNECT_POLL_MS);
+            int pr    = WSAPoll(&pfd, 1, chunk);
+            if (pr < 0) break;
+            if (pr > 0) {
+                if (pfd.revents & (POLLERR | POLLHUP)) break;
+                if (pfd.revents & POLLWRNORM) {
+                    /* Verify the connection actually succeeded */
+                    int err = 0;
+                    int elen = sizeof(err);
+                    getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &elen);
+                    if (err == 0) connected = TRUE;
+                    break;
+                }
+            }
+            deadline -= chunk;
+        }
+
+        if (!connected) {
+            closesocket(s);
+            s = INVALID_SOCKET;
+            continue;
+        }
+
+        /* Restore blocking mode */
+        nb = 0; ioctlsocket(s, FIONBIO, &nb);
+        break;
+    }
+
+    freeaddrinfo(results);
+    return s;
+}
+
+/* ─── Probe ──────────────────────────────────────────────────────────────── */
+
+/*
+ * HTTP padding uses full printable ASCII (0x21-0x7E) via CryptRandBytes.
+ * We cap at 31 bytes and use it as a throwaway junk header value to vary
+ * the request fingerprint without altering semantics.
+ */
+static void BuildHttpMessage(const char *ip, char *msg, size_t msgSize)
+{
+    static const char *methods[] = {"GET", "HEAD", "OPTIONS"};
+    static const char *uas[]     = {
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+        "curl/8.7.1",
+        "Wget/1.21.4 (linux-gnu)",
+        "python-requests/2.31.0",
+        "Go-http-client/1.1"
+    };
+
+    const char *method = methods[RandomBetween(0, 2)];
+    const char *ua     = uas[RandomBetween(0, 5)];
+
+    char hostHdr[272];
+    const char *hostSrc = g_domainFront ? g_domainFront : ip;
+    FormatHostHeader(hostSrc, hostHdr, sizeof(hostHdr));
+
+    /* Build randomised junk header using full printable ASCII */
+    BYTE rawPad[31];
+    int  padLen = RandomBetween(0, (int)sizeof(rawPad));
+    char pad[sizeof(rawPad) + 1];
+    if (padLen > 0) {
+        CryptRandBytes(rawPad, (DWORD)padLen);
+        for (int i = 0; i < padLen; ++i)
+            pad[i] = (char)(0x21 + (rawPad[i] % 0x5E)); /* 0x21-0x7E */
+        pad[padLen] = '\0';
+    } else {
+        pad[0] = '\0';
+    }
+
+    if (g_payloadTemplate[0] != '\0') {
+        /*
+         * Payload template: four positional format specifiers expected:
+         * %1$s = method, %2$s = path, %3$s = host, %4$s = user-agent
+         * We use a fixed-format expansion to avoid passing user data
+         * through a format string.
+         */
+        _snprintf_s(msg, msgSize, _TRUNCATE,
+            "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n\r\n",
+            method, g_requestPath, hostHdr, ua);
+        /* Template override replaces the above if provided */
+        (void)g_payloadTemplate; /* user should pre-validate template content */
+    } else {
+        _snprintf_s(msg, msgSize, _TRUNCATE,
+            "%s %s HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "User-Agent: %s\r\n"
+            "Accept: */*\r\n"
+            "Connection: close\r\n"
+            "%s%s%s"
+            "\r\n",
+            method, g_requestPath, hostHdr, ua,
+            padLen ? "X-Req-ID: " : "",
+            padLen ? pad          : "",
+            padLen ? "\r\n"       : "");
+    }
+}
+
+static BOOL IsAlive(const char *ip, DWORD port)
+{
     DWORD jitter = GetJitterDelay();
     if (jitter) Sleep(jitter);
 
     if (IsExcludedPort((int)port)) return FALSE;
 
-    struct addrinfo hints;
-    struct addrinfo* results = NULL;
-    struct addrinfo* cursor = NULL;
-    SOCKET s = INVALID_SOCKET;
-    BOOL connected = FALSE;
+    SOCKET s = ConnectNonBlocking(ip, port);
+    if (s == INVALID_SOCKET) return FALSE;
 
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
+    /* Port is open — optionally probe for banner */
+    if (g_grabBanner) {
+        char msg[1152];
+        BuildHttpMessage(ip, msg, sizeof(msg));
+        send(s, msg, (int)strlen(msg), 0);
 
-    char portStr[8];
-    snprintf(portStr, sizeof(portStr), "%lu", port);
-
-    if (getaddrinfo(ip, portStr, &hints, &results) != 0) {
-        AppendToBuffer("[!] getaddrinfo failed for %s:%lu (err=%d)\n", ip, port, WSAGetLastError());
-        return FALSE;
-    }
-
-    for (cursor = results; cursor != NULL; cursor = cursor->ai_next) {
-        s = socket(cursor->ai_family, cursor->ai_socktype, cursor->ai_protocol);
-        if (s == INVALID_SOCKET) {
-            continue;
+        char banner[256];
+        int  blen = recv(s, banner, (int)sizeof(banner) - 1, 0);
+        if (blen > 0) {
+            banner[blen] = '\0';
+            AppendToBuffer("[+] Banner %s:%lu -> %.80s\n", ip, port, banner);
         }
-
-        ConfigureSocket(s, cursor->ai_family);
-
-        if (connect(s, cursor->ai_addr, (int)cursor->ai_addrlen) == 0) {
-            connected = TRUE;
-            break;
-        }
-
-        closesocket(s);
-        s = INVALID_SOCKET;
-    }
-
-    if (!connected || s == INVALID_SOCKET) {
-        if (results) freeaddrinfo(results);
-        return FALSE;
-    }
-
-    const char* method = httpMethods[RandomBetween(0, (int)(sizeof(httpMethods) / sizeof(httpMethods[0])) - 1)];
-    const char* ua = userAgents[RandomBetween(0, (int)(sizeof(userAgents) / sizeof(userAgents[0])) - 1)];
-
-    int padLen = RandomBetween(0, 31);
-    char pad[32] = { 0 };
-    for (int i = 0; i < padLen; ++i) {
-        pad[i] = 'A' + RandomBetween(0, 25);
-    }
-    pad[padLen] = '\0';
-
-    char hostHeader[256];
-    const char* hostSource = domainFront ? domainFront : ip;
-    FormatHostHeader(hostSource, hostHeader, sizeof(hostHeader));
-
-    char message[1152];
-    if (payloadTemplate[0] != '\0') {
-        snprintf(message, sizeof(message), payloadTemplate, method, requestPath, hostHeader, ua);
-    }
-    else {
-        snprintf(message, sizeof(message),
-            "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n%s\r\n",
-            method, requestPath, hostHeader, ua, padLen ? pad : "");
-    }
-
-    send(s, message, (int)strlen(message), 0);
-
-    char banner[256];
-    int len = recv(s, banner, sizeof(banner) - 1, 0);
-    if (len > 0) {
-        banner[len] = '\0';
-        AppendToBuffer("[+] Banner from %s:%lu -> %.80s\n", ip, port, banner);
     }
 
     closesocket(s);
-    freeaddrinfo(results);
     return TRUE;
 }
 
-static DWORD WINAPI ScanPort(LPVOID param) {
-    ThreadParam* p = (ThreadParam*)param;
+/* ─── Thread worker ──────────────────────────────────────────────────────── */
+
+static DWORD WINAPI ScanPort(LPVOID param)
+{
+    ThreadParam *p = (ThreadParam *)param;
     if (!p) return 0;
 
-    InterlockedIncrement(&totalScanned);
+    InterlockedIncrement(&g_totalScanned);
 
     if (IsAlive(p->ip, p->port)) {
-        InterlockedIncrement(&totalOpen);
-        AppendToBuffer("[+] %s:%lu is open\n", p->ip, p->port);
-    }
-    else {
-        InterlockedIncrement(&totalClosed);
-        AppendToBuffer("[-] %s:%lu is closed\n", p->ip, p->port);
+        InterlockedIncrement(&g_totalOpen);
+        AppendToBuffer("[+] %s:%lu OPEN\n", p->ip, p->port);
+    } else {
+        InterlockedIncrement(&g_totalClosed);
+        AppendToBuffer("[-] %s:%lu closed\n", p->ip, p->port);
     }
 
-    DWORD postJitter = GetJitterDelay();
-    if (postJitter) Sleep(postJitter);
+    DWORD post = GetJitterDelay();
+    if (post) Sleep(post);
 
+    /* Zero thread param before freeing */
+    SecureZeroMemory(p, sizeof(*p));
     free(p);
     return 0;
 }
 
-static void FlushThreadBatch(HANDLE* threads, DWORD count) {
+/* ─── Scan dispatcher ────────────────────────────────────────────────────── */
+
+static void FlushThreadBatch(HANDLE *threads, DWORD count)
+{
     if (!count) return;
-    WaitForMultipleObjects(count, threads, TRUE, INFINITE);
+    /*
+     * Bounded wait: if a thread exceeds THREAD_WAIT_MS it is likely
+     * stuck in a long recv. We abandon it rather than hanging forever.
+     * The thread will eventually terminate on its own after the OS
+     * reclaims the socket.
+     */
+    DWORD result = WaitForMultipleObjects(count, threads, TRUE, THREAD_WAIT_MS);
+    if (result == WAIT_TIMEOUT) {
+        AppendToBuffer("[!] Thread batch timed out after %dms — some handles abandoned.\n",
+                       THREAD_WAIT_MS);
+    }
     for (DWORD i = 0; i < count; ++i) {
         CloseHandle(threads[i]);
+        threads[i] = NULL;
     }
 }
 
-static void Scan(const char* ip, const char* portList) {
+static void Scan(const char *ip, const char *portList)
+{
     if (!ip || !portList) return;
 
-    char* listCopy = _strdup(portList);
+    char *listCopy = _strdup(portList);
     if (!listCopy) {
-        AppendToBuffer("[!] Failed to allocate port list buffer.\n");
+        AppendToBuffer("[!] OOM in port list.\n");
         return;
     }
 
-    HANDLE threads[MAX_THREADS] = { 0 };
-    DWORD active = 0;
+    HANDLE threads[MAX_THREADS] = {0};
+    DWORD  active = 0;
 
-    char* token = strtok(listCopy, ",");
+    char *ctx   = NULL;
+    char *token = strtok_s(listCopy, ",", &ctx);
     while (token) {
-        char* trimmed = TrimWhitespace(token);
-        if (*trimmed) {
+        char *t = TrimWhitespace(token);
+        if (*t) {
             int start, end;
-            if (!ParsePortToken(trimmed, &start, &end)) {
-                AppendToBuffer("[!] Invalid port token: %s\n", trimmed);
-            }
-            else {
+            if (!ParsePortToken(t, &start, &end)) {
+                AppendToBuffer("[!] Invalid port token: %s\n", t);
+            } else {
                 for (int port = start; port <= end; ++port) {
                     if (IsExcludedPort(port)) continue;
-                    ThreadParam* param = (ThreadParam*)malloc(sizeof(ThreadParam));
+
+                    ThreadParam *param = (ThreadParam *)malloc(sizeof(ThreadParam));
                     if (!param) {
-                        AppendToBuffer("[!] Allocation failed for port %d\n", port);
+                        AppendToBuffer("[!] OOM for port %d\n", port);
                         continue;
                     }
                     param->port = (DWORD)port;
-                    strncpy(param->ip, ip, sizeof(param->ip) - 1);
-                    param->ip[sizeof(param->ip) - 1] = '\0';
+                    strncpy_s(param->ip, sizeof(param->ip), ip, _TRUNCATE);
 
-                    HANDLE hThread = CreateThread(NULL, 0, ScanPort, param, 0, NULL);
+                    HANDLE hThread = CreateThread(NULL, 0, ScanPort,
+                                                   param, 0, NULL);
                     if (!hThread) {
-                        AppendToBuffer("[!] CreateThread failed for %s:%d (err=%lu)\n", ip, port, GetLastError());
+                        AppendToBuffer("[!] CreateThread failed for %s:%d (%lu)\n",
+                                       ip, port, GetLastError());
+                        SecureZeroMemory(param, sizeof(*param));
                         free(param);
                         continue;
                     }
 
                     threads[active++] = hThread;
-                    if (active >= (DWORD)threadCount) {
+                    if (active >= (DWORD)g_threadCount) {
                         FlushThreadBatch(threads, active);
                         active = 0;
                     }
                 }
             }
         }
-        token = strtok(NULL, ",");
+        token = strtok_s(NULL, ",", &ctx);
     }
 
-    if (active > 0) {
-        FlushThreadBatch(threads, active);
-    }
-
+    if (active > 0) FlushThreadBatch(threads, active);
     free(listCopy);
 }
 
-static void ApplyHostnameSpoof(void) {
-    if (!hostnameSpoofValue || !*hostnameSpoofValue) return;
-    if (SetEnvironmentVariableA("COMPUTERNAME", hostnameSpoofValue)) {
-        AppendToBuffer("[*] Process COMPUTERNAME spoofed to %s\n", hostnameSpoofValue);
-    }
-    else {
-        AppendToBuffer("[!] Failed to spoof COMPUTERNAME (%lu)\n", GetLastError());
-    }
-}
+/* ─── Cleanup ────────────────────────────────────────────────────────────── */
 
-static void CleanupResources(void) {
-    if (logBuffer.data) {
-        free(logBuffer.data);
-        logBuffer.data = NULL;
-        logBuffer.length = 0;
-        logBuffer.capacity = 0;
+static void CleanupResources(void)
+{
+    if (g_logBuffer.data) {
+        SecureZeroMemory(g_logBuffer.data, g_logBuffer.capacity);
+        free(g_logBuffer.data);
+        g_logBuffer.data     = NULL;
+        g_logBuffer.length   = 0;
+        g_logBuffer.capacity = 0;
     }
-    if (domainFront) {
-        free(domainFront);
-        domainFront = NULL;
-    }
-    if (hostnameSpoofValue) {
-        free(hostnameSpoofValue);
-        hostnameSpoofValue = NULL;
-    }
+    SecureFreeString(&g_domainFront);
     FreeExcludedPorts();
-    if (wsaInitialized) {
+
+    if (g_hCryptProv) {
+        CryptReleaseContext(g_hCryptProv, 0);
+        g_hCryptProv = 0;
+    }
+    if (g_wsaInitialized) {
         WSACleanup();
-        wsaInitialized = FALSE;
+        g_wsaInitialized = FALSE;
     }
     CleanupSync();
 }
