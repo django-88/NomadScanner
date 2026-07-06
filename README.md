@@ -2,7 +2,7 @@
 
 **OPSEC-hardened TCP port scanner for red team and adversary simulation engagements.**
 
-NomadScanner performs in-memory, multithreaded TCP connect scans with randomised network characteristics designed to blend into baseline traffic. All output is buffered in memory and written once at exit — no intermediate disk artifacts.
+NomadScanner performs in-memory, multithreaded TCP connect scans with randomised network characteristics designed to blend into baseline traffic. All output is buffered in memory and written once at exit  no intermediate disk artifacts.
 
 ---
 
@@ -24,13 +24,13 @@ NomadScanner performs in-memory, multithreaded TCP connect scans with randomised
 - Custom payload template via `--payload`
 - Configurable request path via `--path`
 - Junk `X-Req-ID` header with random-length, full printable-ASCII content to vary request fingerprint
-- **Banner grabbing is opt-in** (`--banner`) — off by default to minimise log exposure
+- **Banner grabbing is opt-in** (`--banner`) off by default to minimise log exposure
 
 ### Network Stealth
 
 - **`CryptGenRandom`-backed CSPRNG** for all entropy (source ports, TTL, TOS, padding, window sizes) replaces `rand()` entirely
 - **Realistic TTL values** sampled from OS fingerprint buckets (64 / 128 / 255) with ±3 variance no constant or obviously-random values
-- **Realistic DSCP/TOS** — weighted toward CS0 (the vast majority of real traffic), with occasional CS1/CS2/CS6
+- **Realistic DSCP/TOS** weighted toward CS0 (the vast majority of real traffic), with occasional CS1/CS2/CS6
 - **Random ephemeral source port** per connection (IANA dynamic range 49152–65535)
 - **Randomised TCP window and buffer sizes** per socket
 - **`TCP_NODELAY`** and **DF bit** set per-family
@@ -111,7 +111,7 @@ Four positional `%s` arguments are substituted in order:
 
 ## Legal
 
-For **authorised use only** — red team engagements, penetration tests, lab research, and internal security tooling. Do not use against systems without explicit written permission.
+For **authorised use only** red team engagements, penetration tests, lab research, and internal security tooling. Do not use against systems without explicit written permission.
 
 ---
 
