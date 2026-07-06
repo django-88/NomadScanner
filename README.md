@@ -10,11 +10,11 @@ NomadScanner performs in-memory, multithreaded TCP connect scans with randomised
 
 ### Core
 
-- **In-memory output** — single `printf` flush at exit, no file writes
-- **Multithreaded** — configurable worker pool (1–64 threads) with batch dispatch
-- **IPv4 & IPv6** — dual-stack via `getaddrinfo`, per-family socket tuning
-- **Port range & exclusion** syntax — `1-1024`, `80,443,8000-8100`
-- **Reliable connect timeout** — non-blocking `connect()` with `WSAPoll()` loop; no silent hangs on filtered ports
+- **In-memory output** single `printf` flush at exit, no file writes
+- **Multithreaded** configurable worker pool (1–64 threads) with batch dispatch
+- **IPv4 & IPv6** dual-stack via `getaddrinfo`, per-family socket tuning
+- **Port range & exclusion** syntax `1-1024`, `80,443,8000-8100`
+- **Reliable connect timeout** non-blocking `connect()` with `WSAPoll()` loop; no silent hangs on filtered ports
 
 ### HTTP Probe
 
